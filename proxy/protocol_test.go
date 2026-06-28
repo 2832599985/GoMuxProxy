@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -163,6 +164,10 @@ func TestLoadConfig_InvalidConfig(t *testing.T) {
 }
 
 func TestSaveConfig_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions not applicable on Windows")
+	}
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "perms.json")
 	cfg := Config{UpstreamProxy: "1.2.3.4:8080"}
@@ -340,6 +345,7 @@ func TestMixedConn_LargeRead(t *testing.T) {
 }
 
 func TestMixedConn_EmptyRead(t *testing.T) {
+	_ = ProtoHTTP
 	mc := &mixedConn{first: 0x05, Conn: nil}
 	n, err := mc.Read(nil)
 	if n != 0 || err != nil {
@@ -378,12 +384,10 @@ func TestMixedConn_SecondReadGoesToConn(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // socks5Client performs a minimal SOCKS5 CONNECT handshake on the client side.
-func socks5Client(t *testing.T, conn net.Conn, target string) {
-	t.Helper()
-
+func socks5Client(conn net.Conn, target string) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
-		t.Fatalf("SplitHostPort(%q): %v", target, err)
+		return fmt.Errorf("SplitHostPort(%q): %w", target, err)
 	}
 	port, _ := strconv.Atoi(portStr)
 
@@ -393,10 +397,10 @@ func socks5Client(t *testing.T, conn net.Conn, target string) {
 	// Read auth response
 	authResp := make([]byte, 2)
 	if _, err := io.ReadFull(conn, authResp); err != nil {
-		t.Fatalf("read auth response: %v", err)
+		return fmt.Errorf("read auth response: %w", err)
 	}
 	if authResp[0] != 0x05 || authResp[1] != 0x00 {
-		t.Fatalf("auth response = %x, want [05 00]", authResp)
+		return fmt.Errorf("auth response = %x, want [05 00]", authResp)
 	}
 
 	// CONNECT request
@@ -421,6 +425,7 @@ func socks5Client(t *testing.T, conn net.Conn, target string) {
 	req = append(req, portBytes...)
 
 	conn.Write(req)
+	return nil
 }
 
 func TestHandleSocks5_IPv4(t *testing.T) {
@@ -428,7 +433,7 @@ func TestHandleSocks5_IPv4(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	go socks5Client(t, client, "93.184.216.34:80")
+	go func() { socks5Client(client, "93.184.216.34:80") }()
 
 	target, err := handleSocks5(server)
 	if err != nil {
@@ -444,7 +449,7 @@ func TestHandleSocks5_IPv6(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	go socks5Client(t, client, "[::1]:443")
+	go func() { socks5Client(client, "[::1]:443") }()
 
 	target, err := handleSocks5(server)
 	if err != nil {
@@ -460,7 +465,7 @@ func TestHandleSocks5_Domain(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	go socks5Client(t, client, "example.com:443")
+	go func() { socks5Client(client, "example.com:443") }()
 
 	target, err := handleSocks5(server)
 	if err != nil {
@@ -501,8 +506,9 @@ func TestHandleSocks5_UnsupportedCommand(t *testing.T) {
 		authResp := make([]byte, 2)
 		io.ReadFull(client, authResp)
 
-		// Send BIND command (0x02) instead of CONNECT (0x01)
-		client.Write([]byte{0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0, 80})
+		// Send BIND command (0x02) — only the 4-byte request header is needed
+		// because handleSocks5 rejects the command before reading the address/port.
+		client.Write([]byte{0x05, 0x02, 0x00, 0x01})
 		// Read the error reply
 		reply := make([]byte, 10)
 		io.ReadFull(client, reply)
@@ -731,7 +737,7 @@ func TestHandleMixed_Socks5Detection(t *testing.T) {
 	// First byte 0x05 -> SOCKS5
 	go func() {
 		// Write 0x05 first byte, then complete SOCKS5 handshake
-		socks5Client(t, client, "10.0.0.1:8080")
+		go func() { socks5Client(client, "10.0.0.1:8080") }()
 	}()
 
 	proto, target, err := handleMixed(server, "127.0.0.1:9999", 5, 5)
@@ -883,7 +889,9 @@ func TestEngine_Socks5Connect(t *testing.T) {
 	defer conn.Close()
 
 	// SOCKS5 handshake
-	socks5Client(t, conn, "93.184.216.34:80")
+	if err := socks5Client(conn, "93.184.216.34:80"); err != nil {
+		t.Fatalf("socks5Client: %v", err)
+	}
 
 	// Read SOCKS5 reply
 	reply := make([]byte, 10)
@@ -937,7 +945,9 @@ func TestEngine_MixedProtocol_Socks5(t *testing.T) {
 	defer conn.Close()
 
 	// Use SOCKS5 handshake on mixed listener
-	socks5Client(t, conn, "10.0.0.1:443")
+	if err := socks5Client(conn, "10.0.0.1:443"); err != nil {
+		t.Fatalf("socks5Client: %v", err)
+	}
 
 	reply := make([]byte, 10)
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -1086,7 +1096,10 @@ func TestEngine_ConcurrentConnections(t *testing.T) {
 			}
 			defer conn.Close()
 
-			socks5Client(t, conn, fmt.Sprintf("10.0.0.%d:80", i+1))
+			if err := socks5Client(conn, fmt.Sprintf("10.0.0.%d:80", i+1)); err != nil {
+				errs <- fmt.Errorf("socks5Client: %w", err)
+				return
+			}
 
 			reply := make([]byte, 10)
 			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
