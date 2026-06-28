@@ -13,10 +13,15 @@
 ```
 main.go                  — 入口，单实例锁(127.0.0.1:48321)
 proxy/
-  proxy.go               — ProxyEngine 核心：监听管理、连接处理、配置读写、验证、缓冲池
+  types.go               — 常量 + 数据类型（ListenEntry、ConnInfo、Stats、PortStats、Config）
+  config.go              — Config.Validate()、SaveConfig()、LoadConfig()
+  engine.go              — ProxyEngine 生命周期：监听管理、启停、增删改查、统计
+  handler.go             — 连接处理：serve 循环、handleConn 协议分发、上游隧道、缓冲池
+  mixed.go               — 混合协议自动检测（mixedConn + handleMixed）
   socks5.go              — SOCKS5 握手（无认证，支持 IPv4/IPv6/域名）
   http.go                — HTTP 代理（CONNECT 隧道 + 普通 HTTP 代理）
-  tunnel.go              — 辅助：bufReader、HTTP 响应读取、multiReader
+  tunnel.go              — 辅助：bufReader、HTTP 响应读取、multiReader、hasPort
+  protocol_test.go       — 测试套件：Config、SOCKS5/HTTP/Mixed 协议、引擎集成
 gui/
   app.go                 — Fyne 主窗口、Tab 布局、事件回调（fyne.Do 线程安全）
   dashboard.go           — 状态监控 Tab：统计卡片 + 端口状态 + 连接表
