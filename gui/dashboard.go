@@ -3,6 +3,8 @@ package gui
 import (
 	"GoMuxProxy/proxy"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -10,8 +12,11 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+const defaultRefreshInterval = 1 * time.Second
+
 type Dashboard struct {
-	engine *proxy.ProxyEngine
+	engine          *proxy.ProxyEngine
+	refreshInterval time.Duration
 
 	totalLabel     *widget.Label
 	activeLabel    *widget.Label
@@ -22,17 +27,37 @@ type Dashboard struct {
 	connTable      *widget.Table
 	portCards      *fyne.Container
 
+	// Cached port card widgets — rebuilt only when port count changes.
+	portCardWidgets []portCardCache
+
+	mu            sync.Mutex
 	lastBytesUp   int64
 	lastBytesDown int64
 	lastCheck     time.Time
 
-	conns []proxy.ConnInfo
+	conns  []proxy.ConnInfo
+	stopCh chan struct{}
 }
 
-func NewDashboard(engine *proxy.ProxyEngine) *Dashboard {
+type portCardCache struct {
+	card          *widget.Card
+	titleLabel    *widget.Label
+	subtitleLabel *widget.Label
+	contentLabel  *widget.Label
+}
+
+var refreshPending atomic.Bool
+
+func NewDashboard(engine *proxy.ProxyEngine, stopCh chan struct{}) *Dashboard {
+	return NewDashboardWithInterval(engine, stopCh, defaultRefreshInterval)
+}
+
+func NewDashboardWithInterval(engine *proxy.ProxyEngine, stopCh chan struct{}, interval time.Duration) *Dashboard {
 	d := &Dashboard{
-		engine:    engine,
-		lastCheck: time.Now(),
+		engine:          engine,
+		refreshInterval: interval,
+		lastCheck:       time.Now(),
+		stopCh:          stopCh,
 	}
 
 	d.totalLabel = widget.NewLabel("累计连接: 0")
@@ -46,7 +71,12 @@ func NewDashboard(engine *proxy.ProxyEngine) *Dashboard {
 
 	headers := []string{"#", "来源", "目标", "协议", "持续时间"}
 	d.connTable = widget.NewTable(
-		func() (int, int) { return len(d.conns) + 1, 5 },
+		func() (int, int) {
+			d.mu.Lock()
+			n := len(d.conns)
+			d.mu.Unlock()
+			return n + 1, 5
+		},
 		func() fyne.CanvasObject {
 			return widget.NewLabel("------------")
 		},
@@ -57,10 +87,13 @@ func NewDashboard(engine *proxy.ProxyEngine) *Dashboard {
 				label.TextStyle = fyne.TextStyle{Bold: true}
 				return
 			}
+			d.mu.Lock()
 			if id.Row-1 >= len(d.conns) {
+				d.mu.Unlock()
 				return
 			}
 			ci := d.conns[id.Row-1]
+			d.mu.Unlock()
 			label.TextStyle = fyne.TextStyle{}
 			switch id.Col {
 			case 0:
@@ -88,16 +121,11 @@ func NewDashboard(engine *proxy.ProxyEngine) *Dashboard {
 }
 
 func (d *Dashboard) Widget() fyne.CanvasObject {
-	statsRow := container.NewHBox(
-		d.totalLabel,
-		widget.NewSeparator(),
-		d.activeLabel,
-		widget.NewSeparator(),
-		d.upSpeedLabel,
-		d.downSpeedLabel,
-		widget.NewSeparator(),
-		d.upTotalLabel,
-		d.downTotalLabel,
+	statsRow := container.NewGridWithColumns(4,
+		container.NewVBox(d.totalLabel, d.activeLabel),
+		container.NewVBox(d.upSpeedLabel, d.downSpeedLabel),
+		container.NewVBox(d.upTotalLabel),
+		container.NewVBox(d.downTotalLabel),
 	)
 
 	portSection := container.NewVBox(
@@ -114,60 +142,115 @@ func (d *Dashboard) Widget() fyne.CanvasObject {
 }
 
 func (d *Dashboard) Refresh() {
+	d.mu.Lock()
 	d.conns = d.engine.GetActiveConns()
+	d.mu.Unlock()
 	d.connTable.Refresh()
 }
 
-func (d *Dashboard) autoRefresh() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		stats := d.engine.GetStats()
-		now := time.Now()
-		elapsed := now.Sub(d.lastCheck).Seconds()
-
-		var upSpeed, downSpeed float64
-		if elapsed > 0 {
-			upSpeed = float64(stats.TotalBytesUp-d.lastBytesUp) / elapsed
-			downSpeed = float64(stats.TotalBytesDown-d.lastBytesDown) / elapsed
-		}
-		d.lastBytesUp = stats.TotalBytesUp
-		d.lastBytesDown = stats.TotalBytesDown
-		d.lastCheck = now
-
-		portStats := d.engine.GetPortStats()
-
-		fyne.Do(func() {
-			d.totalLabel.SetText(fmt.Sprintf("累计连接: %d", stats.TotalConns))
-			d.activeLabel.SetText(fmt.Sprintf("活跃连接: %d", stats.ActiveConns))
-			d.upSpeedLabel.SetText(fmt.Sprintf("↑ %s/s", formatBytes(upSpeed)))
-			d.downSpeedLabel.SetText(fmt.Sprintf("↓ %s/s", formatBytes(downSpeed)))
-			d.upTotalLabel.SetText(fmt.Sprintf("↑ 累计: %s", formatBytesI(stats.TotalBytesUp)))
-			d.downTotalLabel.SetText(fmt.Sprintf("↓ 累计: %s", formatBytesI(stats.TotalBytesDown)))
-
-			d.portCards.Objects = nil
-			for _, ps := range portStats {
-				status := "●"
-				if !ps.Enabled {
-					status = "○"
-				} else if !ps.Running {
-					status = "◐"
-				}
-				card := widget.NewCard(
-					fmt.Sprintf("%s %s", status, ps.Address),
-					protocolLabel(ps.Protocol),
-					widget.NewLabel(fmt.Sprintf("连接数: %d", ps.ActiveConn)),
-				)
-				card.Resize(fyne.NewSize(150, 80))
-				d.portCards.Objects = append(d.portCards.Objects, card)
-			}
-			d.portCards.Refresh()
-
-			d.conns = d.engine.GetActiveConns()
-			d.connTable.Refresh()
+// scheduleRefresh debounces connection events: at most one refresh per 500ms.
+func (d *Dashboard) scheduleRefresh() {
+	if refreshPending.CompareAndSwap(false, true) {
+		time.AfterFunc(500*time.Millisecond, func() {
+			refreshPending.Store(false)
+			fyne.Do(func() { d.Refresh() })
 		})
 	}
+}
+
+// OnConnect handles connect events with debouncing.
+func (d *Dashboard) OnConnect(ci proxy.ConnInfo) {
+	d.scheduleRefresh()
+}
+
+// OnDisconnect handles disconnect events with debouncing.
+func (d *Dashboard) OnDisconnect(ci proxy.ConnInfo) {
+	d.scheduleRefresh()
+}
+
+func (d *Dashboard) autoRefresh() {
+	ticker := time.NewTicker(d.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.updateStats()
+		}
+	}
+}
+
+func (d *Dashboard) updateStats() {
+	stats := d.engine.GetStats()
+	now := time.Now()
+
+	d.mu.Lock()
+	elapsed := now.Sub(d.lastCheck).Seconds()
+	var upSpeed, downSpeed float64
+	if elapsed > 0 {
+		upSpeed = float64(stats.TotalBytesUp-d.lastBytesUp) / elapsed
+		downSpeed = float64(stats.TotalBytesDown-d.lastBytesDown) / elapsed
+	}
+	d.lastBytesUp = stats.TotalBytesUp
+	d.lastBytesDown = stats.TotalBytesDown
+	d.lastCheck = now
+	d.mu.Unlock()
+
+	portStats := d.engine.GetPortStats()
+
+	fyne.Do(func() {
+		d.totalLabel.SetText(fmt.Sprintf("累计连接: %d", stats.TotalConns))
+		d.activeLabel.SetText(fmt.Sprintf("活跃连接: %d", stats.ActiveConns))
+		d.upSpeedLabel.SetText(fmt.Sprintf("↑ %s/s", formatBytes(upSpeed)))
+		d.downSpeedLabel.SetText(fmt.Sprintf("↓ %s/s", formatBytes(downSpeed)))
+		d.upTotalLabel.SetText(fmt.Sprintf("↑ 累计: %s", formatBytesI(stats.TotalBytesUp)))
+		d.downTotalLabel.SetText(fmt.Sprintf("↓ 累计: %s", formatBytesI(stats.TotalBytesDown)))
+
+		d.updatePortCards(portStats)
+
+		d.mu.Lock()
+		d.conns = d.engine.GetActiveConns()
+		d.mu.Unlock()
+		d.connTable.Refresh()
+	})
+}
+
+func (d *Dashboard) updatePortCards(portStats []proxy.PortStats) {
+	// Create cards on first call (or if port count changes); just update text otherwise.
+	if len(d.portCardWidgets) != len(portStats) {
+		d.portCardWidgets = make([]portCardCache, len(portStats))
+		d.portCards.Objects = nil
+		for i := range portStats {
+			cc := portCardCache{
+				titleLabel:    widget.NewLabel(""),
+				subtitleLabel: widget.NewLabel(""),
+				contentLabel:  widget.NewLabel(""),
+			}
+			cc.card = widget.NewCard("", "",
+				container.NewVBox(cc.titleLabel, cc.subtitleLabel, cc.contentLabel))
+			cc.card.Resize(fyne.NewSize(150, 80))
+			d.portCardWidgets[i] = cc
+			d.portCards.Objects = append(d.portCards.Objects, cc.card)
+		}
+	}
+	for i, ps := range portStats {
+		cc := &d.portCardWidgets[i]
+
+		var statusPrefix string
+		if !ps.Enabled {
+			statusPrefix = "[OFF] ○"
+		} else if !ps.Running {
+			statusPrefix = "[ERR] ◐"
+		} else {
+			statusPrefix = "[ON] ●"
+		}
+		cc.titleLabel.SetText(fmt.Sprintf("%s %s", statusPrefix, ps.Address))
+		cc.subtitleLabel.SetText(protocolLabel(ps.Protocol))
+		cc.contentLabel.SetText(fmt.Sprintf("连接数: %d", ps.ActiveConn))
+	}
+	d.portCards.Refresh()
 }
 
 func protocolLabel(p string) string {

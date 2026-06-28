@@ -6,7 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"time"
+	"path/filepath"
 
 	"fyne.io/fyne/v2/app"
 )
@@ -32,7 +32,11 @@ func main() {
 	}
 	defer ln.Close()
 
-	cfgPath := "config.json"
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfgPath := filepath.Join(filepath.Dir(exe), "config.json")
 	cfg := proxy.Config{
 		UpstreamProxy: "127.0.0.1:10810",
 		Listeners: []proxy.ListenEntry{
@@ -57,8 +61,11 @@ func main() {
 	// 保持锁监听，防止被 GC
 	go func() {
 		for {
-			ln.Accept()
-			time.Sleep(time.Second)
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
 		}
 	}()
 

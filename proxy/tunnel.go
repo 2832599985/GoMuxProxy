@@ -9,18 +9,20 @@ import (
 	"strings"
 )
 
-func tunnel(a, b net.Conn) {
+// tunnelCopyPooled is a simple bidirectional tunnel using pooled buffers (no byte counters).
+func tunnelCopyPooled(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(b, a)
+		copyPooled(b, a)
 		b.Close()
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(a, b)
+		copyPooled(a, b)
 		a.Close()
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 }
 

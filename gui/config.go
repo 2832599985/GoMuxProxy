@@ -3,6 +3,8 @@ package gui
 import (
 	"GoMuxProxy/proxy"
 	"fmt"
+	"net"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -13,6 +15,7 @@ import (
 type ConfigTab struct {
 	engine   *proxy.ProxyEngine
 	onChange func()
+	window   fyne.Window
 
 	upstreamEntry *widget.Entry
 	listenerList  *widget.List
@@ -55,23 +58,36 @@ func NewConfigTab(engine *proxy.ProxyEngine, onChange func()) *ConfigTab {
 	return ct
 }
 
+func (ct *ConfigTab) SetWindow(w fyne.Window) {
+	ct.window = w
+}
+
+func (ct *ConfigTab) getWindow() fyne.Window {
+	if ct.window != nil {
+		return ct.window
+	}
+	return fyne.CurrentApp().Driver().AllWindows()[0]
+}
+
+// refreshFromEngine syncs the local listeners slice from the engine config.
+func (ct *ConfigTab) refreshFromEngine() {
+	cfg := ct.engine.Config()
+	ct.listeners = append(ct.listeners[:0], cfg.Listeners...)
+	ct.selected = -1
+	ct.listenerList.Refresh()
+}
+
 func (ct *ConfigTab) Widget() fyne.CanvasObject {
 	upstreamSection := container.NewVBox(
 		widget.NewLabel("上游代理地址"),
 		ct.upstreamEntry,
-		widget.NewButton("应用上游地址", func() {
-			cfg := ct.engine.Config()
-			cfg.UpstreamProxy = ct.upstreamEntry.Text
-			ct.engine.UpdateConfig(cfg)
-			if ct.onChange != nil {
-				ct.onChange()
-			}
-		}),
 	)
 
 	addBtn := widget.NewButton("添加监听", ct.showAddDialog)
+	editBtn := widget.NewButton("编辑选中", ct.showEditDialog)
 	delBtn := widget.NewButton("删除选中", func() {
 		if ct.selected < 0 || ct.selected >= len(ct.listeners) {
+			dialog.ShowInformation("提示", "请先选择一个监听项", ct.getWindow())
 			return
 		}
 		addr := ct.listeners[ct.selected].Address
@@ -82,6 +98,7 @@ func (ct *ConfigTab) Widget() fyne.CanvasObject {
 	})
 	enableBtn := widget.NewButton("启用选中", func() {
 		if ct.selected < 0 || ct.selected >= len(ct.listeners) {
+			dialog.ShowInformation("提示", "请先选择一个监听项", ct.getWindow())
 			return
 		}
 		addr := ct.listeners[ct.selected].Address
@@ -91,6 +108,7 @@ func (ct *ConfigTab) Widget() fyne.CanvasObject {
 	})
 	disableBtn := widget.NewButton("禁用选中", func() {
 		if ct.selected < 0 || ct.selected >= len(ct.listeners) {
+			dialog.ShowInformation("提示", "请先选择一个监听项", ct.getWindow())
 			return
 		}
 		addr := ct.listeners[ct.selected].Address
@@ -100,30 +118,40 @@ func (ct *ConfigTab) Widget() fyne.CanvasObject {
 	})
 
 	saveBtn := widget.NewButton("保存配置", func() {
+		// Apply upstream address from entry before saving
 		cfg := ct.engine.Config()
-		if err := proxy.SaveConfig("config.json", cfg); err != nil {
-			dialog.ShowError(err, fyne.CurrentApp().Driver().AllWindows()[0])
+		cfg.UpstreamProxy = ct.upstreamEntry.Text
+		ct.engine.UpdateConfig(cfg)
+		if ct.onChange != nil {
+			ct.onChange()
+		}
+
+		if err := cfg.Validate(); err != nil {
+			dialog.ShowError(err, ct.getWindow())
 			return
 		}
-		dialog.ShowInformation("保存成功", "配置已保存到 config.json", fyne.CurrentApp().Driver().AllWindows()[0])
+		if err := proxy.SaveConfig("config.json", cfg); err != nil {
+			dialog.ShowError(err, ct.getWindow())
+			return
+		}
+		dialog.ShowInformation("保存成功", "配置已保存到 config.json", ct.getWindow())
 	})
 
 	loadBtn := widget.NewButton("加载配置", func() {
 		cfg, err := proxy.LoadConfig("config.json")
 		if err != nil {
-			dialog.ShowError(err, fyne.CurrentApp().Driver().AllWindows()[0])
+			dialog.ShowError(err, ct.getWindow())
 			return
 		}
 		ct.engine.UpdateConfig(cfg)
-		ct.listeners = append(ct.listeners[:0], cfg.Listeners...)
+		ct.refreshFromEngine()
 		ct.upstreamEntry.SetText(cfg.UpstreamProxy)
-		ct.listenerList.Refresh()
 		if ct.onChange != nil {
 			ct.onChange()
 		}
 	})
 
-	toolbar := container.NewHBox(addBtn, delBtn, widget.NewSeparator(), enableBtn, disableBtn, widget.NewSeparator(), saveBtn, loadBtn)
+	toolbar := container.NewHBox(addBtn, editBtn, delBtn, widget.NewSeparator(), enableBtn, disableBtn, widget.NewSeparator(), saveBtn, loadBtn)
 	listSection := container.NewBorder(
 		widget.NewLabel("监听端口列表 (● 启用 / ○ 禁用)"),
 		toolbar, nil, nil,
@@ -135,6 +163,46 @@ func (ct *ConfigTab) Widget() fyne.CanvasObject {
 		widget.NewSeparator(),
 		listSection,
 	)
+}
+
+// isLoopbackHost checks whether a host string resolves to a loopback address.
+func isLoopbackHost(host string) bool {
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// extractHost strips the port from an "host:port" address.
+func extractHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port or malformed; try treating the whole string as host.
+		return addr
+	}
+	return host
+}
+
+// showLoopbackWarningIfNeeded returns true and shows a confirm dialog if the
+// address is non-loopback. The onConfirm callback is called only when the user
+// confirms. Returns false when the address is loopback (caller should proceed
+// directly).
+func (ct *ConfigTab) showLoopbackWarningIfNeeded(addr string, onConfirm func()) bool {
+	host := extractHost(addr)
+	if isLoopbackHost(host) {
+		return false
+	}
+	w := ct.getWindow()
+	dialog.ShowConfirm("警告", "绑定到非本地地址将暴露代理到网络，确定继续？", func(ok bool) {
+		if ok {
+			onConfirm()
+		}
+	}, w)
+	return true
 }
 
 func (ct *ConfigTab) showAddDialog() {
@@ -153,24 +221,100 @@ func (ct *ConfigTab) showAddDialog() {
 		widget.NewFormItem("协议类型", protoSelect),
 	)
 
-	w := fyne.CurrentApp().Driver().AllWindows()[0]
+	w := ct.getWindow()
 	dialog.ShowCustomConfirm("添加监听端口", "添加", "取消", form, func(ok bool) {
 		if !ok {
 			return
 		}
+		addr := strings.TrimSpace(addrEntry.Text)
+		if addr == "" {
+			dialog.ShowError(fmt.Errorf("地址不能为空"), w)
+			return
+		}
+
 		proto := protocolFromLabel(protoSelect.Selected)
 		entry := proxy.ListenEntry{
 			Network:  "tcp",
-			Address:  addrEntry.Text,
+			Address:  addr,
 			Protocol: proto,
 			Enabled:  true,
 		}
-		if err := ct.engine.AddListener(entry); err != nil {
-			dialog.ShowError(err, w)
+
+		addEntry := func() {
+			if err := ct.engine.AddListener(entry); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			ct.listeners = append(ct.listeners, entry)
+			ct.listenerList.Refresh()
+		}
+
+		if ct.showLoopbackWarningIfNeeded(addr, addEntry) {
+			return // warning dialog will call addEntry if confirmed
+		}
+		addEntry()
+	}, w)
+}
+
+func (ct *ConfigTab) showEditDialog() {
+	if ct.selected < 0 || ct.selected >= len(ct.listeners) {
+		dialog.ShowInformation("提示", "请先选择一个监听项", ct.getWindow())
+		return
+	}
+
+	sel := ct.listeners[ct.selected]
+
+	addrEntry := widget.NewEntry()
+	addrEntry.SetText(sel.Address)
+
+	protoSelect := widget.NewSelect([]string{
+		"混合(SOCKS5/HTTP)",
+		"SOCKS5",
+		"HTTP 代理",
+	}, nil)
+	protoSelect.SetSelected(protocolLabelCN(sel.Protocol))
+
+	form := widget.NewForm(
+		widget.NewFormItem("监听地址", addrEntry),
+		widget.NewFormItem("协议类型", protoSelect),
+	)
+
+	w := ct.getWindow()
+	dialog.ShowCustomConfirm("编辑监听端口", "保存", "取消", form, func(ok bool) {
+		if !ok {
 			return
 		}
-		ct.listeners = append(ct.listeners, entry)
-		ct.listenerList.Refresh()
+		newAddr := strings.TrimSpace(addrEntry.Text)
+		if newAddr == "" {
+			dialog.ShowError(fmt.Errorf("地址不能为空"), w)
+			return
+		}
+
+		proto := protocolFromLabel(protoSelect.Selected)
+		newEntry := proxy.ListenEntry{
+			Network:  sel.Network,
+			Address:  newAddr,
+			Protocol: proto,
+			Enabled:  sel.Enabled,
+		}
+
+		applyEdit := func() {
+			// Remove old listener, ignore error if already stopped.
+			ct.engine.RemoveListener(sel.Address)
+
+			// Re-add with new settings (enabled state preserved).
+			if err := ct.engine.AddListener(newEntry); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			ct.listeners[ct.selected] = newEntry
+			ct.listenerList.Refresh()
+		}
+
+		if ct.showLoopbackWarningIfNeeded(newAddr, applyEdit) {
+			return // warning dialog will call applyEdit if confirmed
+		}
+		applyEdit()
 	}, w)
 }
 

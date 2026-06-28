@@ -1,6 +1,9 @@
 package gui
 
 import (
+	"strings"
+	"sync"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
@@ -11,6 +14,7 @@ type LogView struct {
 	filter   *widget.Entry
 	allLines []string
 	scroll   *container.Scroll
+	mu       sync.Mutex
 }
 
 func NewLogView() *LogView {
@@ -48,6 +52,9 @@ func (lv *LogView) Widget() fyne.CanvasObject {
 }
 
 func (lv *LogView) Append(msg string) {
+	lv.mu.Lock()
+	defer lv.mu.Unlock()
+
 	lv.allLines = append(lv.allLines, msg)
 
 	if len(lv.allLines) > 5000 {
@@ -58,42 +65,13 @@ func (lv *LogView) Append(msg string) {
 }
 
 func (lv *LogView) applyFilter() {
-	filter := lv.filter.Text
-	var text string
+	filter := strings.ToLower(lv.filter.Text)
+	var b strings.Builder
 	for _, line := range lv.allLines {
-		if filter == "" || containsIgnoreCase(line, filter) {
-			text += line + "\n"
+		if filter == "" || strings.Contains(strings.ToLower(line), filter) {
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
-	lv.entry.SetText(text)
-}
-
-func containsIgnoreCase(s, sub string) bool {
-	if sub == "" {
-		return true
-	}
-	sLower := toLower(s)
-	subLower := toLower(sub)
-	return contains(sLower, subLower)
-}
-
-func toLower(s string) string {
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+	lv.entry.SetText(b.String())
 }

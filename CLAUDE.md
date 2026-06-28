@@ -13,7 +13,7 @@
 ```
 main.go                  — 入口，单实例锁(127.0.0.1:48321)
 proxy/
-  proxy.go               — ProxyEngine 核心：监听管理、连接处理、配置读写
+  proxy.go               — ProxyEngine 核心：监听管理、连接处理、配置读写、验证、缓冲池
   socks5.go              — SOCKS5 握手（无认证，支持 IPv4/IPv6/域名）
   http.go                — HTTP 代理（CONNECT 隧道 + 普通 HTTP 代理）
   tunnel.go              — 辅助：bufReader、HTTP 响应读取、multiReader
@@ -21,7 +21,7 @@ gui/
   app.go                 — Fyne 主窗口、Tab 布局、事件回调（fyne.Do 线程安全）
   dashboard.go           — 状态监控 Tab：统计卡片 + 端口状态 + 连接表
   logview.go             — 日志 Tab：过滤、清空、5000 行上限
-  config.go              — 配置 Tab：上游地址、监听列表增删改、保存/加载 config.json
+  config.go              — 配置 Tab：上游地址、监听列表增删改查、保存/加载 config.json
   tray.go                — 系统托盘：显示窗口 / 退出
   icon.go                — //go:embed icon_256.png
   icon_256.png           — 窗口/托盘图标（256x256）
@@ -77,9 +77,17 @@ go build -ldflags "-H windowsgui" -o GoMuxProxy.exe .
     {"network": "tcp", "address": "127.0.0.1:1081", "protocol": "mixed", "enabled": true},
     {"network": "tcp", "address": "127.0.0.1:1082", "protocol": "mixed", "enabled": true},
     {"network": "tcp", "address": "127.0.0.1:1083", "protocol": "mixed", "enabled": true}
-  ]
+  ],
+  "upstream_timeout": 10,
+  "mixed_detect_timeout": 5,
+  "max_connections": 1000
 }
 ```
+
+可选字段（省略时使用默认值）：
+- `upstream_timeout`：上游连接超时秒数（默认 10）
+- `mixed_detect_timeout`：混合模式首字节检测超时秒数（默认 5）
+- `max_connections`：最大并发连接数（默认 1000）
 
 protocol 可选值：`socks5`、`http`、`mixed`（自动检测）
 
@@ -87,7 +95,11 @@ protocol 可选值：`socks5`、`http`、`mixed`（自动检测）
 
 - **单实例保护**：监听 127.0.0.1:48321，失败则退出，防止重复启动
 - **混合协议检测**：首字节 0x05 -> SOCKS5，ASCII 字母 -> HTTP，用 `mixedConn` 回放首字节
-- **线程安全**：GUI 更新用 `fyne.Do()` 包裹，ProxyEngine 用 `sync.RWMutex` + `atomic`
+- **线程安全**：GUI 更新用 `fyne.Do()` 包裹，ProxyEngine 用 `sync.RWMutex` + `atomic.Int64` 计数器
+- **连接限制**：`connSemaphore` 信号量限制并发连接数（默认 1000，可配置）
+- **缓冲池**：`sync.Pool` 复用 32KB 缓冲区，减少 GC 压力
+- **SOCKS5 RFC 合规**：先建立上游连接再回复成功状态码
+- **配置验证**：`Config.Validate()` 校验地址格式、重复端口、协议值
 - **关闭窗口不退出**：最小化到系统托盘，托盘菜单退出程序
 - **无控制台窗口**：`-H windowsgui` 链接器标志
 
@@ -101,3 +113,6 @@ protocol 可选值：`socks5`、`http`、`mixed`（自动检测）
 | 修改窗口标题 | `gui/app.go` NewWindow 参数 |
 | 调整 Dashboard 刷新频率 | `gui/dashboard.go` autoRefresh 的 time.Second |
 | 修改单实例锁端口 | `main.go` lockAddr |
+| 修改最大并发连接数 | `config.json` max_connections 或 `proxy/proxy.go` 默认值 |
+| 修改上游连接超时 | `config.json` upstream_timeout |
+| 修改协议检测超时 | `config.json` mixed_detect_timeout |

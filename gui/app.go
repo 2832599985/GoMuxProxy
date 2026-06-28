@@ -2,11 +2,10 @@ package gui
 
 import (
 	"GoMuxProxy/proxy"
-	"fmt"
-	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 )
 
 type App struct {
@@ -18,20 +17,20 @@ type App struct {
 	logView   *LogView
 	configTab *ConfigTab
 
-	logMu   sync.Mutex
-	logText string
+	stopCh chan struct{}
 }
 
 func NewApp(fyneApp fyne.App, engine *proxy.ProxyEngine) *App {
 	a := &App{
 		fyneApp: fyneApp,
 		engine:  engine,
+		stopCh:  make(chan struct{}),
 	}
 
 	// 设置应用图标（影响窗口标题栏和任务栏图标）
 	fyneApp.SetIcon(iconResource())
 
-	a.dashboard = NewDashboard(engine)
+	a.dashboard = NewDashboard(engine, a.stopCh)
 	a.logView = NewLogView()
 	a.configTab = NewConfigTab(engine, a.onConfigChanged)
 
@@ -39,7 +38,9 @@ func NewApp(fyneApp fyne.App, engine *proxy.ProxyEngine) *App {
 
 	go func() {
 		if err := engine.Start(); err != nil {
-			a.onLog(fmt.Sprintf("启动错误: %v", err))
+			fyne.Do(func() {
+				dialog.ShowError(err, a.mainWindow)
+			})
 		}
 	}()
 
@@ -62,9 +63,10 @@ func (a *App) Run() {
 	tabs.SetTabLocation(container.TabLocationTop)
 
 	a.mainWindow.SetContent(tabs)
+	a.configTab.SetWindow(a.mainWindow)
 
 	setupTray(a.fyneApp, a.mainWindow, func() {
-		a.engine.Stop()
+		a.Close()
 		a.fyneApp.Quit()
 	})
 
@@ -72,30 +74,31 @@ func (a *App) Run() {
 }
 
 func (a *App) onLog(msg string) {
-	a.logMu.Lock()
-	a.logText += msg + "\n"
-	a.logMu.Unlock()
 	fyne.Do(func() {
 		a.logView.Append(msg)
 	})
 }
 
 func (a *App) onConnect(ci proxy.ConnInfo) {
-	fyne.Do(func() {
-		a.dashboard.Refresh()
-	})
+	a.dashboard.OnConnect(ci)
 }
 
 func (a *App) onDisconnect(ci proxy.ConnInfo) {
-	fyne.Do(func() {
-		a.dashboard.Refresh()
-	})
+	a.dashboard.OnDisconnect(ci)
 }
 
 func (a *App) onConfigChanged() {
 	if a.engine.IsRunning() {
 		if err := a.engine.Restart(); err != nil {
-			a.onLog(fmt.Sprintf("重启错误: %v", err))
+			fyne.Do(func() {
+				dialog.ShowError(err, a.mainWindow)
+			})
 		}
 	}
+}
+
+// Close signals the dashboard autoRefresh goroutine to stop and stops the engine.
+func (a *App) Close() {
+	close(a.stopCh)
+	a.engine.Stop()
 }

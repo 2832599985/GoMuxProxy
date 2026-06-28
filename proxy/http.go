@@ -5,15 +5,22 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
-func handleHTTPProxy(conn net.Conn, upstreamProxy string) (string, error) {
+func handleHTTPProxy(conn net.Conn, upstreamProxy string, upstreamTimeout int) (string, *bufio.Reader, error) {
+	// Slow-client protection: 30s deadline for the initial handshake read.
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
-		return "", fmt.Errorf("http read request: %w", err)
+		return "", nil, fmt.Errorf("http read request: %w", err)
 	}
+
+	// Clear deadline after successful read.
+	conn.SetReadDeadline(time.Time{})
 
 	if req.Method == http.MethodConnect {
 		host := req.Host
@@ -27,42 +34,53 @@ func handleHTTPProxy(conn net.Conn, upstreamProxy string) (string, error) {
 			ProtoMinor: 1,
 			Header:     make(http.Header),
 		}
-		resp.Header.Set("Proxy-Agent", "GoMuxProxy")
 		if err := resp.Write(conn); err != nil {
-			return "", err
+			return "", nil, err
 		}
-		return host, nil
+		// Return br so the caller can use it for tunnelling;
+		// any bytes already buffered from the client are preserved.
+		return host, br, nil
 	}
 
+	// Plain HTTP request — forward entirely through the upstream CONNECT tunnel.
 	host := req.Host
 	if !hasPort(host) {
 		host = net.JoinHostPort(host, "80")
 	}
 
-	upstream, err := net.DialTimeout("tcp", upstreamProxy, 10*time.Second)
+	upstream, err := net.DialTimeout("tcp", upstreamProxy, time.Duration(upstreamTimeout)*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("dial upstream: %w", err)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return "", nil, fmt.Errorf("dial upstream: %w", err)
 	}
 	defer upstream.Close()
 
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
-	if _, err := upstream.Write([]byte(connectReq)); err != nil {
-		return "", err
+	var connectReq strings.Builder
+	connectReq.WriteString("CONNECT ")
+	connectReq.WriteString(host)
+	connectReq.WriteString(" HTTP/1.1\r\nHost: ")
+	connectReq.WriteString(host)
+	connectReq.WriteString("\r\n\r\n")
+	if _, err := upstream.Write([]byte(connectReq.String())); err != nil {
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return "", nil, err
 	}
 
 	upstreamBR := bufio.NewReader(upstream)
 	resp, err := http.ReadResponse(upstreamBR, nil)
 	if err != nil {
-		return "", fmt.Errorf("upstream read response: %w", err)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return "", nil, fmt.Errorf("upstream read response: %w", err)
 	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("upstream CONNECT failed: %d", resp.StatusCode)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return "", nil, fmt.Errorf("upstream CONNECT failed: %d", resp.StatusCode)
 	}
 
 	if err := req.Write(upstream); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	tunnel(conn, upstream)
-	return "", nil
+	tunnelCopyPooled(conn, upstream)
+	return "", nil, nil
 }

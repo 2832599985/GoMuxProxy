@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 )
 
 func handleSocks5(conn net.Conn) (string, error) {
@@ -31,7 +32,7 @@ func handleSocks5(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("socks5 read request: %w", err)
 	}
 	if req[1] != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		writeSocks5Reply(conn, 0x07) // command not supported
 		return "", fmt.Errorf("socks5 unsupported command: %d", req[1])
 	}
 
@@ -53,6 +54,9 @@ func handleSocks5(conn net.Conn) (string, error) {
 			return "", err
 		}
 		host = string(domain)
+		if strings.ContainsAny(host, "\r\n\x00") {
+			return "", fmt.Errorf("socks5 invalid hostname: %q", host)
+		}
 	case 0x04:
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(conn, addr); err != nil {
@@ -60,7 +64,7 @@ func handleSocks5(conn net.Conn) (string, error) {
 		}
 		host = net.IP(addr).String()
 	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		writeSocks5Reply(conn, 0x08) // address type not supported
 		return "", fmt.Errorf("socks5 unsupported address type: %d", req[3])
 	}
 
@@ -71,10 +75,14 @@ func handleSocks5(conn net.Conn) (string, error) {
 	port := binary.BigEndian.Uint16(portBuf)
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-	if _, err := conn.Write(reply); err != nil {
-		return "", err
-	}
-
+	// Success reply is sent by the caller after upstream connection is established.
 	return target, nil
+}
+
+// writeSocks5Reply sends a SOCKS5 reply with the given status code.
+// Status codes: 0x00 success, 0x04 host unreachable, 0x05 connection refused, etc.
+func writeSocks5Reply(conn net.Conn, status byte) error {
+	reply := []byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	_, err := conn.Write(reply)
+	return err
 }

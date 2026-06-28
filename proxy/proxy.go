@@ -1,16 +1,32 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+const (
+	ProtoSocks5 = "socks5"
+	ProtoHTTP   = "http"
+	ProtoMixed  = "mixed"
+)
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+
+func copyPooled(dst io.Writer, src io.Reader) (int64, error) {
+	bp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bp)
+	return io.CopyBuffer(dst, src, *bp)
+}
 
 type ListenEntry struct {
 	Network  string `json:"network"`
@@ -46,8 +62,11 @@ type PortStats struct {
 }
 
 type Config struct {
-	UpstreamProxy string        `json:"upstream_proxy"`
-	Listeners     []ListenEntry `json:"listeners"`
+	UpstreamProxy      string        `json:"upstream_proxy"`
+	Listeners          []ListenEntry `json:"listeners"`
+	UpstreamTimeout    int           `json:"upstream_timeout,omitempty"`
+	MixedDetectTimeout int           `json:"mixed_detect_timeout,omitempty"`
+	MaxConnections     int           `json:"max_connections,omitempty"`
 }
 
 type ProxyEngine struct {
@@ -60,16 +79,26 @@ type ProxyEngine struct {
 	totalBytesUp   atomic.Int64
 	totalBytesDown atomic.Int64
 	running        atomic.Bool
+	perPortCount   sync.Map // address -> *atomic.Int64
 
 	onLog        func(string)
 	onConnect    func(ConnInfo)
 	onDisconnect func(ConnInfo)
+
+	serveWg        sync.WaitGroup
+	restartMu      sync.Mutex
+	connSemaphore  chan struct{}
 }
 
 func NewEngine(cfg Config) *ProxyEngine {
+	maxConn := cfg.MaxConnections
+	if maxConn <= 0 {
+		maxConn = 1000
+	}
 	return &ProxyEngine{
-		config:    cfg,
-		listeners: make(map[string]net.Listener),
+		config:        cfg,
+		listeners:     make(map[string]net.Listener),
+		connSemaphore: make(chan struct{}, maxConn),
 	}
 }
 
@@ -104,9 +133,9 @@ func (e *ProxyEngine) Start() error {
 		return fmt.Errorf("already running")
 	}
 
-	e.mu.RLock()
+	e.mu.Lock()
 	cfg := e.config
-	e.mu.RUnlock()
+	e.mu.Unlock()
 
 	e.logf("启动代理引擎，上游: %s", cfg.UpstreamProxy)
 	e.running.Store(true)
@@ -130,6 +159,7 @@ func (e *ProxyEngine) startOne(entry ListenEntry) error {
 		return err
 	}
 	e.listeners[entry.Address] = ln
+	e.serveWg.Add(1)
 	go e.serve(ln, entry)
 	e.logf("监听 %s 于 %s", protocolLabel(entry.Protocol), entry.Address)
 	return nil
@@ -155,6 +185,7 @@ func (e *ProxyEngine) Stop() {
 	e.listeners = make(map[string]net.Listener)
 	e.mu.Unlock()
 
+	e.serveWg.Wait()
 	e.logf("代理引擎已停止")
 }
 
@@ -162,13 +193,13 @@ func (e *ProxyEngine) AddListener(entry ListenEntry) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.config.Listeners = append(e.config.Listeners, entry)
-
 	if e.running.Load() && entry.Enabled {
 		if err := e.startOne(entry); err != nil {
 			return err
 		}
 	}
+
+	e.config.Listeners = append(e.config.Listeners, entry)
 	e.logf("新增监听 %s 于 %s (启用: %v)", protocolLabel(entry.Protocol), entry.Address, entry.Enabled)
 	return nil
 }
@@ -226,8 +257,10 @@ func (e *ProxyEngine) ToggleListener(address string, enabled bool) error {
 }
 
 func (e *ProxyEngine) Restart() error {
+	e.restartMu.Lock()
+	defer e.restartMu.Unlock()
+
 	e.Stop()
-	time.Sleep(100 * time.Millisecond)
 	return e.Start()
 }
 
@@ -237,8 +270,8 @@ func (e *ProxyEngine) IsRunning() bool {
 
 func (e *ProxyEngine) GetStats() Stats {
 	var active int64
-	e.activeConns.Range(func(_, _ interface{}) bool {
-		active++
+	e.perPortCount.Range(func(_, v any) bool {
+		active += v.(*atomic.Int64).Load()
 		return true
 	})
 	return Stats{
@@ -262,13 +295,9 @@ func (e *ProxyEngine) GetPortStats() []PortStats {
 			Running:  listening,
 			Enabled:  entry.Enabled,
 		}
-		e.activeConns.Range(func(_, v interface{}) bool {
-			ci := v.(*ConnInfo)
-			if ci.ListenAddr == entry.Address {
-				ps.ActiveConn++
-			}
-			return true
-		})
+		if v, ok := e.perPortCount.Load(entry.Address); ok {
+			ps.ActiveConn = v.(*atomic.Int64).Load()
+		}
 		result = append(result, ps)
 	}
 	return result
@@ -285,6 +314,7 @@ func (e *ProxyEngine) GetActiveConns() []ConnInfo {
 }
 
 func (e *ProxyEngine) serve(ln net.Listener, entry ListenEntry) {
+	defer e.serveWg.Done()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -294,7 +324,13 @@ func (e *ProxyEngine) serve(ln net.Listener, entry ListenEntry) {
 			e.logf("[%s] 接受连接错误: %v", entry.Address, err)
 			continue
 		}
-		go e.handleConn(conn, entry)
+		e.serveWg.Add(1)
+		go func() {
+			defer e.serveWg.Done()
+			e.connSemaphore <- struct{}{}
+			e.handleConn(conn, entry)
+			<-e.connSemaphore
+		}()
 	}
 }
 
@@ -303,6 +339,12 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 
 	connID := e.nextConnID.Add(1)
 	e.totalConns.Add(1)
+
+	// Per-port atomic count
+	ppVal, _ := e.perPortCount.LoadOrStore(entry.Address, &atomic.Int64{})
+	ppCounter := ppVal.(*atomic.Int64)
+	ppCounter.Add(1)
+	defer ppCounter.Add(-1)
 
 	ci := &ConnInfo{
 		ID:         connID,
@@ -314,17 +356,33 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 	var target string
 	var err error
 	var detectedProto string
+	var httpBR *bufio.Reader // buffered reader from HTTP CONNECT, may contain client data
+
+	// Snapshot upstream proxy under lock
+	e.mu.RLock()
+	upstream := e.config.UpstreamProxy
+	upstreamTimeout := e.config.UpstreamTimeout
+	detectTimeout := e.config.MixedDetectTimeout
+	e.mu.RUnlock()
+
+	if upstreamTimeout <= 0 {
+		upstreamTimeout = 10
+	}
+	if detectTimeout <= 0 {
+		detectTimeout = 5
+	}
 
 	switch entry.Protocol {
-	case "socks5":
+	case ProtoSocks5:
 		ci.Protocol = "SOCKS5"
 		target, err = handleSocks5(client)
-	case "http":
+		// Reply is sent below after connectViaUpstream succeeds or fails.
+	case ProtoHTTP:
 		ci.Protocol = "HTTP"
-		target, err = handleHTTPProxy(client, e.config.UpstreamProxy)
-	case "mixed":
-		detectedProto, target, err = handleMixed(client, e.config.UpstreamProxy)
-		if detectedProto == "socks5" {
+		target, httpBR, err = handleHTTPProxy(client, upstream, upstreamTimeout)
+	case ProtoMixed:
+		detectedProto, target, err = handleMixed(client, upstream, upstreamTimeout, detectTimeout)
+		if detectedProto == ProtoSocks5 {
 			ci.Protocol = "SOCKS5"
 		} else {
 			ci.Protocol = "HTTP"
@@ -334,7 +392,15 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 	}
 
 	if err != nil {
+		if entry.Protocol == ProtoSocks5 || (entry.Protocol == ProtoMixed && detectedProto == ProtoSocks5) {
+			writeSocks5Reply(client, 0x01) // general failure
+		}
 		e.logf("[%s] #%d 握手失败: %v", entry.Address, connID, err)
+		return
+	}
+
+	// Plain HTTP proxy handles its own tunnel internally; nothing more to do.
+	if entry.Protocol == ProtoHTTP && httpBR == nil && target == "" {
 		return
 	}
 
@@ -345,8 +411,19 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 	}
 	e.logf("[%s] #%d %s -> %s (%s)", entry.Address, connID, ci.Source, target, ci.Protocol)
 
-	if err := e.connectViaUpstream(client, target, ci); err != nil {
-		e.logf("[%s] #%d 隧道错误: %v", entry.Address, connID, err)
+	isSocks5 := entry.Protocol == ProtoSocks5 || (entry.Protocol == ProtoMixed && detectedProto == ProtoSocks5)
+	upstreamErr := e.connectViaUpstream(client, target, ci, upstream, upstreamTimeout, httpBR)
+
+	if isSocks5 {
+		if upstreamErr != nil {
+			writeSocks5Reply(client, 0x05) // connection refused
+		} else {
+			writeSocks5Reply(client, 0x00) // success
+		}
+	}
+
+	if upstreamErr != nil {
+		e.logf("[%s] #%d 隧道错误: %v", entry.Address, connID, upstreamErr)
 	}
 
 	e.activeConns.Delete(connID)
@@ -358,15 +435,20 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 	e.logf("[%s] #%d 已断开 (上行:%d 下行:%d)", entry.Address, connID, ci.BytesUp, ci.BytesDown)
 }
 
-func (e *ProxyEngine) connectViaUpstream(client net.Conn, target string, ci *ConnInfo) error {
-	upstream, err := net.DialTimeout("tcp", e.config.UpstreamProxy, 10*time.Second)
+func (e *ProxyEngine) connectViaUpstream(client net.Conn, target string, ci *ConnInfo, upstreamAddr string, timeoutSec int, httpBR *bufio.Reader) error {
+	upstream, err := net.DialTimeout("tcp", upstreamAddr, time.Duration(timeoutSec)*time.Second)
 	if err != nil {
-		return fmt.Errorf("连接上游 %s: %w", e.config.UpstreamProxy, err)
+		return fmt.Errorf("连接上游 %s: %w", upstreamAddr, err)
 	}
 	defer upstream.Close()
 
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
-	if _, err := upstream.Write([]byte(connectReq)); err != nil {
+	var connectReq strings.Builder
+	connectReq.WriteString("CONNECT ")
+	connectReq.WriteString(target)
+	connectReq.WriteString(" HTTP/1.1\r\nHost: ")
+	connectReq.WriteString(target)
+	connectReq.WriteString("\r\n\r\n")
+	if _, err := upstream.Write([]byte(connectReq.String())); err != nil {
 		return fmt.Errorf("发送 CONNECT: %w", err)
 	}
 
@@ -379,44 +461,53 @@ func (e *ProxyEngine) connectViaUpstream(client net.Conn, target string, ci *Con
 		return fmt.Errorf("上游 CONNECT %s 返回 %d", target, resp.StatusCode)
 	}
 
+	// Build client reader: prepend any bytes already buffered from the client
+	// (by handleHTTPProxy's bufio.Reader), then the raw connection.
+	var clientR io.Reader
+	if httpBR != nil {
+		clientR = io.MultiReader(httpBR, client)
+	} else {
+		clientR = client
+	}
+
+	// Prepend any bytes buffered from the upstream CONNECT response.
 	if br.Buffered() > 0 {
 		extra := make([]byte, br.Buffered())
 		br.Read(extra)
-		clientR := newMultiReader(extra, client)
-		e.tunnelWithCounter(clientR, client, upstream, ci)
-	} else {
-		e.tunnelWithCounter(client, client, upstream, ci)
+		clientR = newMultiReader(extra, clientR)
 	}
 
+	e.tunnel(clientR, client, upstream, ci)
 	return nil
 }
 
-func (e *ProxyEngine) tunnelWithCounter(clientR io.Reader, clientW net.Conn, upstream net.Conn, ci *ConnInfo) {
+func (e *ProxyEngine) tunnel(clientR io.Reader, clientW net.Conn, upstream net.Conn, ci *ConnInfo) {
 	done := make(chan struct{}, 2)
 
 	go func() {
-		n, _ := io.Copy(upstream, clientR)
+		n, _ := copyPooled(upstream, clientR)
 		atomic.AddInt64(&ci.BytesUp, n)
 		upstream.Close()
 		done <- struct{}{}
 	}()
 	go func() {
-		n, _ := io.Copy(clientW, upstream)
+		n, _ := copyPooled(clientW, upstream)
 		atomic.AddInt64(&ci.BytesDown, n)
 		clientW.Close()
 		done <- struct{}{}
 	}()
 
 	<-done
+	<-done
 }
 
 func protocolLabel(p string) string {
 	switch p {
-	case "socks5":
+	case ProtoSocks5:
 		return "SOCKS5"
-	case "http":
+	case ProtoHTTP:
 		return "HTTP代理"
-	case "mixed":
+	case ProtoMixed:
 		return "混合(SOCKS5+HTTP)"
 	default:
 		return p
@@ -428,7 +519,7 @@ func SaveConfig(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -438,14 +529,39 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	err = json.Unmarshal(data, &cfg)
-	return cfg, err
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, cfg.Validate()
+}
+
+func (c Config) Validate() error {
+	if _, _, err := net.SplitHostPort(c.UpstreamProxy); err != nil {
+		return fmt.Errorf("invalid upstream_proxy %q: %w", c.UpstreamProxy, err)
+	}
+	seen := map[string]bool{}
+	for i, l := range c.Listeners {
+		if _, _, err := net.SplitHostPort(l.Address); err != nil {
+			return fmt.Errorf("listeners[%d]: invalid address %q: %w", i, l.Address, err)
+		}
+		if seen[l.Address] {
+			return fmt.Errorf("listeners[%d]: duplicate address %s", i, l.Address)
+		}
+		seen[l.Address] = true
+		switch l.Protocol {
+		case ProtoSocks5, ProtoHTTP, ProtoMixed:
+		default:
+			return fmt.Errorf("listeners[%d]: unknown protocol %q", i, l.Protocol)
+		}
+	}
+	return nil
 }
 
 // handleMixed 自动检测协议：读取第一个字节判断是 SOCKS5 还是 HTTP
 // SOCKS5 第一个字节是 0x05，HTTP 第一个字节是方法名的 ASCII (G/P/C/H 等)
-func handleMixed(client net.Conn, upstreamProxy string) (protocol string, target string, err error) {
+func handleMixed(client net.Conn, upstreamProxy string, upstreamTimeout, detectTimeout int) (protocol string, target string, err error) {
 	buf := make([]byte, 1)
-	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	client.SetReadDeadline(time.Now().Add(time.Duration(detectTimeout) * time.Second))
 	_, err = io.ReadFull(client, buf)
 	client.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -462,11 +578,11 @@ func handleMixed(client net.Conn, upstreamProxy string) (protocol string, target
 
 	if firstByte == 0x05 {
 		target, err = handleSocks5(protoConn)
-		return "socks5", target, err
+		return ProtoSocks5, target, err
 	}
 
-	target, err = handleHTTPProxy(protoConn, upstreamProxy)
-	return "http", target, err
+	target, _, err = handleHTTPProxy(protoConn, upstreamProxy, upstreamTimeout)
+	return ProtoHTTP, target, err
 }
 
 type mixedConn struct {
@@ -476,11 +592,20 @@ type mixedConn struct {
 }
 
 func (c *mixedConn) Read(p []byte) (int, error) {
-	if !c.consumed && len(p) > 0 {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !c.consumed {
 		p[0] = c.first
 		c.consumed = true
+		if len(p) == 1 {
+			return 1, nil
+		}
 		n, err := c.Conn.Read(p[1:])
-		return n + 1, err
+		if n > 0 {
+			return n + 1, nil
+		}
+		return 1, err
 	}
 	return c.Conn.Read(p)
 }
