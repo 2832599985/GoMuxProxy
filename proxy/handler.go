@@ -118,14 +118,21 @@ func (e *ProxyEngine) handleConn(client net.Conn, entry ListenEntry) {
 	e.logf("[%s] #%d %s -> %s (%s)", entry.Address, connID, ci.Source, target, ci.Protocol)
 
 	isSocks5 := entry.Protocol == ProtoSocks5 || (entry.Protocol == ProtoMixed && detectedProto == ProtoSocks5)
+
+	// For SOCKS5, send the success reply BEFORE tunnelling so the client knows
+	// it can start sending data. The client blocks on this reply.
+	if isSocks5 {
+		if err := writeSocks5Reply(client, 0x00); err != nil {
+			e.logf("[%s] #%d SOCKS5 回复失败: %v", entry.Address, connID, err)
+			return
+		}
+	}
+
 	upstreamErr := e.connectViaUpstream(client, target, ci, upstream, upstreamTimeout, httpBR)
 
-	if isSocks5 {
-		if upstreamErr != nil {
-			writeSocks5Reply(client, 0x05) // connection refused
-		} else {
-			writeSocks5Reply(client, 0x00) // success
-		}
+	if isSocks5 && upstreamErr != nil {
+		// Connection to upstream failed — reply already sent as success,
+		// so we just log and close (client will see a broken tunnel).
 	}
 
 	if upstreamErr != nil {
