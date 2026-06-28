@@ -385,7 +385,7 @@ func socks5Client(t *testing.T, conn net.Conn, target string) {
 	if err != nil {
 		t.Fatalf("SplitHostPort(%q): %v", target, err)
 	}
-	port, _ := net.Atoi(portStr)
+	port, _ := strconv.Atoi(portStr)
 
 	// Greeting: version=5, 1 method, no-auth
 	conn.Write([]byte{0x05, 0x01, 0x00})
@@ -904,7 +904,7 @@ func TestEngine_Socks5Connect(t *testing.T) {
 }
 
 func TestEngine_HTTPConnect(t *testing.T) {
-	engine, listenAddr, cleanup := startTestEngine(t, ProtoHTTP)
+	_, listenAddr, cleanup := startTestEngine(t, ProtoHTTP)
 	defer cleanup()
 
 	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
@@ -927,7 +927,7 @@ func TestEngine_HTTPConnect(t *testing.T) {
 }
 
 func TestEngine_MixedProtocol_Socks5(t *testing.T) {
-	engine, listenAddr, cleanup := startTestEngine(t, ProtoMixed)
+	_, listenAddr, cleanup := startTestEngine(t, ProtoMixed)
 	defer cleanup()
 
 	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
@@ -950,7 +950,7 @@ func TestEngine_MixedProtocol_Socks5(t *testing.T) {
 }
 
 func TestEngine_MixedProtocol_HTTP(t *testing.T) {
-	engine, listenAddr, cleanup := startTestEngine(t, ProtoMixed)
+	_, listenAddr, cleanup := startTestEngine(t, ProtoMixed)
 	defer cleanup()
 
 	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
@@ -1173,7 +1173,7 @@ func TestEngine_BadListener(t *testing.T) {
 	engine.SetCallbacks(func(s string) {}, func(ci ConnInfo) {}, func(ci ConnInfo) {})
 
 	// Try to add a listener on an invalid address
-	entry := ListenEntry{Network: "tcp", Address: "invalid:address:format", Protocol: ProtoSocks5, Enabled: true}
+	_ = ListenEntry{Network: "tcp", Address: "invalid:address:format", Protocol: ProtoSocks5, Enabled: true}
 	if err := engine.Start(); err != nil {
 		// engine start with no listeners is fine
 	}
