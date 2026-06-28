@@ -1,0 +1,7 @@
+#include <winuser.h>
+
+// Icon
+1 ICON "icon.ico"
+
+// Manifest for Windows DPI awareness
+1 RT_MANIFEST "GoMuxProxy.exe.manifest"

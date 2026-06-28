@@ -1,0 +1,16 @@
+# Binaries
+*.exe
+*.syso
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Go
+vendor/
